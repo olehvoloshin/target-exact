@@ -668,6 +668,66 @@ class PurchaseEntriesSink(ExactSink):
         except Exception as e:
             return {"error": str(e)}
 
+    def _get_existing_line_ids(self, entry_id: str) -> list:
+        """Return the IDs of the PurchaseEntryLines currently attached to a PurchaseEntry."""
+        response = self.request_api(
+            "GET",
+            endpoint="/purchaseentry/PurchaseEntryLines",
+            params={"$filter": f"EntryID eq guid'{entry_id}'", "$select": "ID"},
+        )
+        response_json = xmltodict.parse(response.text)
+        # an empty result parses as {"feed": None} (the "feed" key is present but its
+        # value isn't a dict), so .get("feed", {}) alone doesn't protect against it
+        entries = (response_json.get("feed") or {}).get("entry")
+        if not entries:
+            return []
+        if isinstance(entries, dict):
+            entries = [entries]
+        return [entry["content"]["m:properties"]["d:ID"]["#text"] for entry in entries]
+
+    def _replace_purchase_entry_lines(self, entry_id: str, new_lines: list) -> list:
+        """Replace all PurchaseEntryLines for an existing PurchaseEntry.
+
+        Exact's OData API does not support replacing the nested PurchaseEntryLines
+        collection via a single PUT on the parent PurchaseEntries resource (embedding
+        lines in a header PUT either errors or duplicates lines - see commit 9994f11,
+        "fix payload for PUT purchase entries", 2024-01-02). Lines must instead be
+        deleted and recreated individually through their own endpoint.
+        """
+        existing_line_ids = self._get_existing_line_ids(entry_id)
+
+        deleted_ids = []
+        try:
+            for line_id in existing_line_ids:
+                self.request_api(
+                    "DELETE", endpoint=f"/purchaseentry/PurchaseEntryLines(guid'{line_id}')"
+                )
+                deleted_ids.append(line_id)
+        except Exception as e:
+            raise Exception(
+                f"Failed to delete existing PurchaseEntryLines for entry {entry_id} "
+                f"(deleted {len(deleted_ids)}/{len(existing_line_ids)} lines before failure, "
+                f"entry lines are now in a partially-deleted state and need manual review): {e}"
+            )
+
+        created_ids = []
+        try:
+            for line in new_lines:
+                line_payload = dict(line)
+                line_payload["EntryID"] = entry_id
+                response = self.request_api(
+                    "POST", endpoint="/purchaseentry/PurchaseEntryLines", request_data=line_payload
+                )
+                line_json = xmltodict.parse(response.text)
+                created_ids.append(line_json["entry"]["content"]["m:properties"]["d:ID"]["#text"])
+        except Exception as e:
+            raise Exception(
+                f"Deleted {len(deleted_ids)} old PurchaseEntryLines for entry {entry_id} but "
+                f"failed to recreate them (created {len(created_ids)}/{len(new_lines)} new lines "
+                f"before failure - entry may now have NO lines and needs manual review): {e}"
+            )
+        return created_ids
+
     def upsert_record(self, record: dict, context: dict) -> None:
         """Process the record."""
         state_updates = dict()
@@ -679,12 +739,15 @@ class PurchaseEntriesSink(ExactSink):
                 raise Exception(record.get("error"))
             # check if there is id to update or create the record
             id = record.pop("Id", None)
+            new_lines = record.pop("PurchaseEntryLines", None)
             if id:
                 endpoint = f"{self.endpoint}(guid'{id}')"
                 method = "PUT"
                 action = "updated"
-                record.pop("PurchaseEntryLines", None)
                 state_updates["is_updated"] = True
+            elif new_lines is not None:
+                # Creating a new entry - lines are embedded in the single POST, as before.
+                record["PurchaseEntryLines"] = new_lines
             
             try:
                 response = self.request_api(
@@ -709,5 +772,12 @@ class PurchaseEntriesSink(ExactSink):
             if response.status_code == 201:
                 res_json = xmltodict.parse(response.text)
                 id = res_json["entry"]["content"]["m:properties"]["d:EntryID"]["#text"]
+
+            # Header PUT succeeded - now that we know the entry itself is valid, replace
+            # its lines. If this fails, the header change is still kept (better than
+            # silently keeping stale amounts, and it's already logged/raised below).
+            if method == "PUT" and new_lines is not None:
+                self._replace_purchase_entry_lines(id, new_lines)
+
             self.logger.info(f"{self.name} {action} with id: {id}")
             return id, True, state_updates
