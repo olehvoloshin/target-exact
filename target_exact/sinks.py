@@ -693,22 +693,15 @@ class PurchaseEntriesSink(ExactSink):
         lines in a header PUT either errors or duplicates lines - see commit 9994f11,
         "fix payload for PUT purchase entries", 2024-01-02). Lines must instead be
         deleted and recreated individually through their own endpoint.
+
+        Create the new lines BEFORE deleting the old ones. Exact rejects deleting a
+        PurchaseEntry's last remaining line with "Unexpected number of lines. Should
+        be at least one line." - confirmed live (job jvgkWM): an entry with 1 existing
+        line failed on the very first DELETE, before any new line existed to replace
+        it. Creating first means the entry always has >= 1 line at every point in
+        time, at the cost of briefly showing both old and new lines together.
         """
         existing_line_ids = self._get_existing_line_ids(entry_id)
-
-        deleted_ids = []
-        try:
-            for line_id in existing_line_ids:
-                self.request_api(
-                    "DELETE", endpoint=f"/purchaseentry/PurchaseEntryLines(guid'{line_id}')"
-                )
-                deleted_ids.append(line_id)
-        except Exception as e:
-            raise Exception(
-                f"Failed to delete existing PurchaseEntryLines for entry {entry_id} "
-                f"(deleted {len(deleted_ids)}/{len(existing_line_ids)} lines before failure, "
-                f"entry lines are now in a partially-deleted state and need manual review): {e}"
-            )
 
         created_ids = []
         try:
@@ -722,9 +715,24 @@ class PurchaseEntriesSink(ExactSink):
                 created_ids.append(line_json["entry"]["content"]["m:properties"]["d:ID"]["#text"])
         except Exception as e:
             raise Exception(
-                f"Deleted {len(deleted_ids)} old PurchaseEntryLines for entry {entry_id} but "
-                f"failed to recreate them (created {len(created_ids)}/{len(new_lines)} new lines "
-                f"before failure - entry may now have NO lines and needs manual review): {e}"
+                f"Failed to create new PurchaseEntryLines for entry {entry_id} "
+                f"(created {len(created_ids)}/{len(new_lines)} lines before failure - "
+                f"old lines were left untouched, entry now has {len(existing_line_ids)} old "
+                f"line(s) plus {len(created_ids)} new one(s) and needs manual review): {e}"
+            )
+
+        deleted_ids = []
+        try:
+            for line_id in existing_line_ids:
+                self.request_api(
+                    "DELETE", endpoint=f"/purchaseentry/PurchaseEntryLines(guid'{line_id}')"
+                )
+                deleted_ids.append(line_id)
+        except Exception as e:
+            raise Exception(
+                f"Created {len(created_ids)} new PurchaseEntryLines for entry {entry_id} but "
+                f"failed to delete the old ones (deleted {len(deleted_ids)}/{len(existing_line_ids)} "
+                f"before failure - entry now has BOTH old and new lines and needs manual review): {e}"
             )
         return created_ids
 
